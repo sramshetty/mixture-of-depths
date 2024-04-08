@@ -241,7 +241,7 @@ class MoDBlock(nn.Module):
         # MoD paper mentions routing every other block working best
         bsz, seq_len, _ = x.shape
         if self.layer_id % 2 and router:
-            token_weights = router(x).squeeze()
+            token_weights = router(x).squeeze(2)
             k = min(seq_len, self.capacity)
             topk_weights_idx = torch.topk(token_weights, k=k).indices
             botk_weights_idx = torch.topk(token_weights, k=seq_len-k, largest=False).indices
