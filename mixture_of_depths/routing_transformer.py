@@ -1,7 +1,9 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import math
 from typing import Optional
 
+from einops import repeat
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,7 +35,10 @@ class ModelArgs:
     max_seq_len: int = 2048
 
     routing: bool = True
-    capacity: int = max_seq_len // 8  # empriical choice from MoD paper
+    aux_routing: bool = False  # whether to use auxiliary router
+    capacity: int = max_seq_len // 8  # empirical choice from MoD paper
+    router_skip_blocks: int = 2  # Apply router every `router_skip_blocks`
+    aux_loss: bool = False  # whether to use auxiliary loss
 
 
 class Attention(nn.Module):
@@ -180,7 +185,13 @@ class FeedForward(nn.Module):
     
 
 class MoDBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(
+        self,
+        layer_id: int,
+        args: ModelArgs,
+        router: nn.Module,
+        aux_router: nn.Module,
+    ):
         """
         Initialize a TransformerBlock.
 
@@ -197,8 +208,9 @@ class MoDBlock(nn.Module):
             layer_id (int): Identifier for the layer.
             attention_norm (RMSNorm): Layer normalization for attention output.
             ffn_norm (RMSNorm): Layer normalization for feedforward output.
+            router (torch.nn.Module): Linear layer to predict which tokens to route through or around block.
             capacity (int): Number of tokens to route through block.
-
+            block_skip (int): Number of blocks to skip between routing.
         """
         super().__init__()
         self.n_heads = args.n_heads
@@ -214,13 +226,17 @@ class MoDBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-
+        
+        # MoD attributes
+        self.router = router
+        self.aux_router = aux_router
+        self.aux_routing = args.aux_routing
         self.capacity = args.capacity
+        self.block_skip = args.router_skip_blocks
 
     def forward(
         self,
         x: torch.Tensor,
-        router: nn.Module,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
@@ -239,24 +255,38 @@ class MoDBlock(nn.Module):
 
         """
         # MoD paper mentions routing every other block working best
-        bsz, seq_len, _ = x.shape
-        if self.layer_id % 2 and router:
-            token_weights = router(x).squeeze(2)
+        seq_len = x.size(1)
+        token_weights = None
+        aux_weights = None
+        topk_indices = None
+        if self.layer_id % self.block_skip and self.router:
+            if self.aux_routing:
+                # when using auxiliary router for inference
+                token_weights = self.aux_router(x.detach()).squeeze(2)
+                if self.training():
+                    # when training we still want to use our base router
+                    # but we want to train our aux router
+                    aux_weights = token_weights.clone()
+                    token_weights = self.router(x).squeeze(2)
+            else:
+                token_weights = self.router(x).squeeze(2)
+
             k = min(seq_len, self.capacity)
-            topk_weights_idx = torch.topk(token_weights, k=k).indices
-            botk_weights_idx = torch.topk(token_weights, k=seq_len-k, largest=False).indices
+            topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+            sorted_indices = torch.argsort(topk_indices)
 
-            batches = torch.arange(bsz).unsqueeze(-1)
-            y = x[batches, botk_weights_idx].clone()
-            x = x[batches, topk_weights_idx]
-        
-        new_seq_len = x.size(1)
-        freqs_cis = freqs_cis[start_pos : start_pos + new_seq_len]
-        if new_seq_len > 1:
-            mask = torch.full(
-                (new_seq_len, new_seq_len), float("-inf"), device=x.device
+            y = x.clone()
+            x = x.gather(
+                dim=1,
+                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
             )
+            seq_len = x.size(1)
+            freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
 
+        if seq_len > 1:
+            mask = torch.full(
+                (seq_len, seq_len), float("-inf"), device=x.device
+            )
             mask = torch.triu(mask, diagonal=1)
 
             # When performing key-value caching, we compute the attention scores
@@ -264,7 +294,7 @@ class MoDBlock(nn.Module):
             # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
             # j > cache_len + i, since row i corresponds to token cache_len + i.
             mask = torch.hstack([
-                torch.zeros((new_seq_len, start_pos), device=x.device),
+                torch.zeros((seq_len, start_pos), device=x.device),
                 mask
             ]).type_as(x)
 
@@ -273,18 +303,21 @@ class MoDBlock(nn.Module):
         )
 
         out = self.feed_forward(self.ffn_norm(h))
-        if self.layer_id % 2 and router:
-            out *= token_weights[batches, topk_weights_idx].unsqueeze(2)
+        if self.layer_id % self.block_skip and self.router:
+            # multiply router weights with hiddens to put router on gradient path
+            out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
 
         out = h + out
 
-        if self.layer_id % 2 and router:
-            output = torch.zeros((bsz, seq_len, self.dim), device=x.device)
-            output[batches, topk_weights_idx] = out
-            output[batches, botk_weights_idx] = y
-            out = output
+        if self.layer_id % self.block_skip and self.router:
+            # add routed through token hiddens back to previous
+            out = y.scatter_add(
+                dim=1,
+                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                src=out
+            )
         
-        return out
+        return out, token_weights, aux_weights, topk_indices
 
 
 class MoDTransformer(nn.Module):
@@ -305,7 +338,7 @@ class MoDTransformer(nn.Module):
             output (ColumnParallelLinear): Linear layer for final output.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             router (torch.nn.Module): Linear layer for mixture of depth token routing.
-
+            aux_router (torch.nn.Module): Linear layer for autoregressive mixture of depth token routing.
         """
         super().__init__()
         self.params = params
@@ -316,9 +349,17 @@ class MoDTransformer(nn.Module):
             params.vocab_size, params.dim,
         )
 
+        # routers
+        self.router = nn.Identity()
+        self.aux_router = nn.Identity()
+        if params.routing:
+            self.router = nn.Linear(params.dim, 1)
+            if params.aux_routing:
+                self.aux_router = nn.Linear(params.dim, 1)
+
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(MoDBlock(layer_id, params))
+            self.layers.append(MoDBlock(layer_id, params, self.router, self.aux_router))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = ColumnParallelLinear(
@@ -331,12 +372,10 @@ class MoDTransformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-        # router
-        self.router = None
-        if params.routing:
-            self.router = nn.Linear(params.dim, 1)
-
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(
+        self,tokens: torch.Tensor,
+        start_pos: int,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
@@ -348,14 +387,24 @@ class MoDTransformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        _bsz, seqlen = tokens.shape
+        seqlen = tokens.size(1)
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
-        for layer in self.layers:
-            h = layer(h, self.router, start_pos, freqs_cis, mask)
+        outputs = defaultdict(list)
+        for i, layer in enumerate(self.layers):
+            h, token_weights, aux_weights, topk_indices = layer(h, start_pos, freqs_cis, mask)
+            if i % self.params.router_skip_blocks:
+                if self.params.aux_loss or self.params.aux_routing:
+                    outputs['topk_indices'].append(topk_indices.cpu())
+                if self.params.aux_loss:
+                    outputs['token_weights'].append(token_weights.cpu())
+                if self.params.aux_routing:
+                    outputs['aux_weights'].append(aux_weights.cpu())
+
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        outputs['output'] = output
+        return outputs

@@ -9,17 +9,17 @@ An unofficial implementation of ["Mixture-of-Depths: Dynamically allocating comp
 ## Current Results
 - 50 million parameter model
     - Baseline after 1 epoch:
-        - Loss: 4.04
-        - Samples/sec: 5.83
-    - MoD after 1 epoch:
-        - Loss: 4.06
-        - Samples/sec: 6.77
+        - Loss: -
+        - Samples/sec: -
+    - MoD w/ Auxiliary Loss after 1 epoch:
+        - Loss: 3.82
+        - Samples/sec: 7.84
 
 
 ## TODO
 - [ ] Validate
 - [ ] Sampling methods
-    - [ ] Auxiliary loss
+    - [x] Auxiliary loss
     - [ ] "Second" router
 
 
