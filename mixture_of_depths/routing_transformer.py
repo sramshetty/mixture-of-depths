@@ -189,8 +189,8 @@ class MoDBlock(nn.Module):
         self,
         layer_id: int,
         args: ModelArgs,
-        router: nn.Module,
-        aux_router: nn.Module,
+        router: Optional[nn.Module],
+        aux_router: Optional[nn.Module],
     ):
         """
         Initialize a TransformerBlock.
@@ -198,6 +198,8 @@ class MoDBlock(nn.Module):
         Args:
             layer_id (int): Identifier for the layer.
             args (ModelArgs): Model configuration parameters.
+            router (torch.nn.Module, optional): Token router to use for MoD.
+            aux_router (torch.nn.Module, optional): Auxiliary token router for inference.
 
         Attributes:
             n_heads (int): Number of attention heads.
@@ -209,6 +211,8 @@ class MoDBlock(nn.Module):
             attention_norm (RMSNorm): Layer normalization for attention output.
             ffn_norm (RMSNorm): Layer normalization for feedforward output.
             router (torch.nn.Module): Linear layer to predict which tokens to route through or around block.
+            aux_router (torch.nn.Module): Auxiliary linear layer to predict which tokens to route through or around block.
+            aux_routing (bool): Whether to use auxiliary router at inference.
             capacity (int): Number of tokens to route through block.
             block_skip (int): Number of blocks to skip between routing.
         """
@@ -263,7 +267,7 @@ class MoDBlock(nn.Module):
             if self.aux_routing:
                 # when using auxiliary router for inference
                 token_weights = self.aux_router(x.detach()).squeeze(2)
-                if self.training():
+                if self.training:
                     # when training we still want to use our base router
                     # but we want to train our aux router
                     aux_weights = token_weights.clone()
@@ -350,12 +354,16 @@ class MoDTransformer(nn.Module):
         )
 
         # routers
-        self.router = nn.Identity()
-        self.aux_router = nn.Identity()
+        self.router = None
+        self.aux_router = None
         if params.routing:
-            self.router = nn.Linear(params.dim, 1)
+            self.router = nn.Linear(params.dim, 1, bias=False)
             if params.aux_routing:
-                self.aux_router = nn.Linear(params.dim, 1)
+                self.aux_router = nn.Sequential(
+                    nn.Linear(params.dim, params.dim // 2, bias=False),
+                    nn.SiLU(),
+                    nn.Linear(params.dim // 2, 1, bias=False)
+                )
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -397,14 +405,13 @@ class MoDTransformer(nn.Module):
         for i, layer in enumerate(self.layers):
             h, token_weights, aux_weights, topk_indices = layer(h, start_pos, freqs_cis, mask)
             if i % self.params.router_skip_blocks:
-                if self.params.aux_loss or self.params.aux_routing:
-                    outputs['topk_indices'].append(topk_indices.cpu())
-                if self.params.aux_loss:
-                    outputs['token_weights'].append(token_weights.cpu())
                 if self.params.aux_routing:
+                    outputs['topk_indices'].append(topk_indices.cpu())
                     outputs['aux_weights'].append(aux_weights.cpu())
-
+                elif self.params.aux_loss:
+                    outputs['topk_indices'].append(topk_indices.cpu())
+                    outputs['token_weights'].append(token_weights.cpu())
+                    
         h = self.norm(h)
-        output = self.output(h).float()
-        outputs['output'] = output
+        outputs['output'] = self.output(h).float()
         return outputs
