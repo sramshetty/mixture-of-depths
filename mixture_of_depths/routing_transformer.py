@@ -95,6 +95,23 @@ class Attention(nn.Module):
             input_is_parallel=True,
         )
 
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -124,9 +141,22 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        if not self.training:
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+            keys = self.cache_k[:bsz, : start_pos + seqlen]
+            values = self.cache_v[:bsz, : start_pos + seqlen]
+        else:
+            keys = xk
+            values = xv
+        
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -285,7 +315,7 @@ class MoDBlock(nn.Module):
                 index=repeat(sorted_indices, 'b s -> b s d', d=self.dim)
             )
             seq_len = x.size(1)
-            freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
+            freqs_cis = freqs_cis[:seq_len]
 
         if seq_len > 1:
             mask = torch.full(
@@ -404,7 +434,7 @@ class MoDTransformer(nn.Module):
         outputs = defaultdict(list)
         for i, layer in enumerate(self.layers):
             h, token_weights, aux_weights, topk_indices = layer(h, start_pos, freqs_cis, mask)
-            if i % self.params.router_skip_blocks:
+            if i % self.params.router_skip_blocks and self.training:
                 if self.params.aux_routing:
                     outputs['topk_indices'].append(topk_indices.cpu())
                     outputs['aux_weights'].append(aux_weights.cpu())
