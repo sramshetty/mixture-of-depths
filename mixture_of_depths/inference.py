@@ -145,18 +145,14 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if not self.training:
-            self.cache_k = self.cache_k.to(xq)
-            self.cache_v = self.cache_v.to(xq)
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
 
-            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-            keys = self.cache_k[:bsz, : start_pos + seqlen]
-            values = self.cache_v[:bsz, : start_pos + seqlen]
-        else:
-            keys = xk
-            values = xv
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
         
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -292,26 +288,30 @@ class MoDBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        # MoD paper mentions routing every other block working best
+        # TODO: support batch inference
         seq_len = x.size(1)
         token_weights = None
         aux_weights = None
         topk_indices = None
+        y = None
+        
+        # MoD paper mentions routing every other block working best
         if self.layer_id % self.block_skip and self.router:
             if self.aux_routing:
                 # when using auxiliary router for inference
-                token_weights = self.aux_router(x.detach()).squeeze(2)
-                if self.training:
-                    # when training we still want to use our base router
-                    # but we want to train our aux router
-                    aux_weights = token_weights.clone()
-                    token_weights = self.router(x).squeeze(2)
+                token_weights = self.aux_router(x).squeeze(2)
             else:
                 token_weights = self.router(x).squeeze(2)
 
-            k = min(seq_len, self.capacity)
-            topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
-            sorted_indices = torch.argsort(topk_indices)
+            token_weights = torch.sigmoid(token_weights)
+            if start_pos == 0:
+                k = min(seq_len, self.capacity)
+                topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+                sorted_indices = torch.argsort(topk_indices)
+            else:
+                # when generating autoregressively
+                sorted_indices = (token_weights > 0.5).nonzero(as_tuple=True)[1].unsqueeze(0)
+                topk_weights = token_weights
 
             y = x.clone()
             x = x.gather(
@@ -336,24 +336,29 @@ class MoDBlock(nn.Module):
                 mask
             ]).type_as(x)
 
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
-
-        out = self.feed_forward(self.ffn_norm(h))
-        if self.layer_id % self.block_skip and self.router:
-            # multiply router weights with hiddens to put router on gradient path
-            out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
-
-        out = h + out
-
-        if self.layer_id % self.block_skip and self.router:
-            # add routed through token hiddens back to previous
-            out = y.scatter_add(
-                dim=1,
-                index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
-                src=out
+        if seq_len > 0:
+            h = x + self.attention(
+                self.attention_norm(x), start_pos, freqs_cis, mask
             )
+
+            out = self.feed_forward(self.ffn_norm(h))
+        
+            if self.layer_id % self.block_skip and self.router:
+                # multiply router weights with hiddens to put router on gradient path
+                out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+
+            out = h + out
+
+            if self.layer_id % self.block_skip and self.router:
+                # add routed through token hiddens back to previous
+                out = y.scatter_add(
+                    dim=1,
+                    index=repeat(sorted_indices, 'b s -> b s d', d=self.dim),
+                    src=out
+                )
+        elif y is not None:
+            # if skipping token for seq_len of 1
+            out = y
         
         return out, token_weights, aux_weights, topk_indices
 
