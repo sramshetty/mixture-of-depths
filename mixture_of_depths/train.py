@@ -35,7 +35,7 @@ class MoDLlamaTrainer():
         batches = torch.arange(token_weights.size(0)).unsqueeze(-1)
         aux_targets[batches, torch.stack(topk_indices).flatten(0,1)] = 1.0
         aux_targets = aux_targets.flatten()
-        return criterion(token_weights.flatten().to("cuda"), aux_targets.to("cuda"))
+        return criterion(token_weights.flatten().to("cuda"), aux_targets.to("cuda")), aux_targets
 
     def train(
         self,
@@ -77,7 +77,7 @@ class MoDLlamaTrainer():
                 causal_loss = 0.0
                 if use_aux_loss:
                     # compute auxiliary loss
-                    causal_loss = self.compute_causal_loss(outputs['token_weights'], outputs['topk_indices'])
+                    causal_loss, _ = self.compute_causal_loss(outputs['token_weights'], outputs['topk_indices'])
                     loss += causal_loss
                     running_causal_loss += causal_loss.detach().cpu().item()
                         
@@ -138,12 +138,11 @@ class MoDLlamaTrainer():
 
                     # compute auxiliary loss
                     causal_loss = 0.0
-                    causal_loss = self.compute_causal_loss(outputs['aux_weights'], outputs['topk_indices'])
+                    causal_loss, aux_targets = self.compute_causal_loss(outputs['aux_weights'], outputs['topk_indices'])
                     running_causal_loss += causal_loss.detach().cpu().item()
                 
                     # measure accuracy during training
                     token_weights = torch.stack(outputs['aux_weights']).flatten(0,1)
-                    aux_targets = torch.zeros_like(token_weights)
                     batches = torch.arange(token_weights.size(0)).unsqueeze(-1)
                     k = min(token_weights.size(-1), self.params.capacity)
                     pred_indices = torch.topk(token_weights, k=k, sorted=False).indices
