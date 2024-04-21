@@ -95,23 +95,6 @@ class Attention(nn.Module):
             input_is_parallel=True,
         )
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).cuda()
-
     def forward(
         self,
         x: torch.Tensor,
@@ -141,18 +124,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if not self.training:
-            self.cache_k = self.cache_k.to(xq)
-            self.cache_v = self.cache_v.to(xq)
-
-            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-            keys = self.cache_k[:bsz, : start_pos + seqlen]
-            values = self.cache_v[:bsz, : start_pos + seqlen]
-        else:
-            keys = xk
-            values = xv
+        keys = xk
+        values = xv
         
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -288,25 +261,23 @@ class MoDBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        # MoD paper mentions routing every other block working best
         seq_len = x.size(1)
         token_weights = None
         aux_weights = None
         topk_indices = None
+
+        # MoD paper mentions routing every other block working best
         if self.layer_id % self.block_skip and self.router:
             if self.aux_routing:
-                # when using auxiliary router for inference
-                token_weights = self.aux_router(x.detach()).squeeze(2)
-                if self.training:
-                    # when training we still want to use our base router
-                    # but we want to train our aux router
-                    aux_weights = token_weights.clone()
-                    token_weights = self.router(x).squeeze(2)
+                # when training we still want to use our base router
+                # but we want to be able to train our aux router
+                aux_weights = self.aux_router(x.detach()).squeeze(2)
+                token_weights = self.router(x).squeeze(2)
             else:
                 token_weights = self.router(x).squeeze(2)
 
             k = min(seq_len, self.capacity)
-            topk_weights, topk_indices = torch.topk(token_weights, k=k, sorted=False)
+            topk_weights, topk_indices = torch.topk(torch.sigmoid(token_weights), k=k, sorted=False)
             sorted_indices = torch.argsort(topk_indices)
 
             y = x.clone()

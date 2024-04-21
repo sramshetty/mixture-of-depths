@@ -12,6 +12,13 @@ pip install einops
 
 ## Details
 - Implementing MoD in Llama 2
+- Follow paper's configuration with some assumptions.
+    - Route every other layer
+    - Training configurations for both causal inference methods proposed
+- Notes on auxiliary router for causal inference:
+    - Currently, train it separately after MoD Llama is trained.
+    - Simple task as we achieve high token prediction accuracy quickly, further simplified by using simple dataset.
+
 - `MoD_training.ipynb` demonstrates training and was uses for the results below.
 - `MoD_sampling.ipynb` demonstrates generation which each method.
     - MoD with an auxiliary router doesn't seem to work as well as with just an auxiliary loss (probably a bug).
@@ -32,20 +39,20 @@ pip install einops
     - Tiny Stories
         - Baseline after 5 epochs:
             - Loss: 2.46
-            - Samples/sec: 11.38
+            - Samples/sec: 11.22
         - MoD w/ Auxiliary Loss after 5 epochs:
-            - Loss: 2.54
-            - Samples/sec: 13.08
+            - Loss: 2.55
+            - Samples/sec: 11.33
         - MoD w/ Auxiliary Router after 5 epochs:
-            - Loss: 2.53
-            - Samples/sec: 12.43
+            - Loss: 2.48
+            - Auxilairy Router Causal Loss: 0.15 
+            - Samples/sec: 11.54
 
 ## TODO
 - [x] Validate
 - [x] Sampling methods
     - [x] Auxiliary loss
     - [x] "Second" router
-        - [ ] bug?
 
 
 ## Citations
