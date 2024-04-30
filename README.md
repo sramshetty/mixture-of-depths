@@ -16,13 +16,11 @@ pip install einops
     - Route every other layer
     - Training configurations for both causal inference methods proposed
 - Notes on auxiliary router for causal inference:
-    - Currently, train it separately after MoD Llama is trained.
-    - Simple task as we achieve high token prediction accuracy quickly, further simplified by using simple dataset.
+    - Currently, we train it separately after MoD Llama is trained.
+    - Simple task as we achieve high token prediction accuracy quickly, which is further simplified by using a simple dataset.
 
-- `MoD_training.ipynb` demonstrates training and was uses for the results below.
-- `MoD_sampling.ipynb` demonstrates generation which each method.
-    - MoD with an auxiliary router doesn't seem to work as well as with just an auxiliary loss (probably a bug).
-
+- `MoD_training.ipynb` demonstrates training and was used for the results below.
+- `MoD_sampling.ipynb` demonstrates generation with each method.
 
 ## Results
 - 50 million parameter model
