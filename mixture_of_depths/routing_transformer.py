@@ -278,7 +278,7 @@ class MoDBlock(nn.Module):
 
             k = min(seq_len, self.capacity)
             topk_weights, topk_indices = torch.topk(torch.sigmoid(token_weights), k=k, sorted=False)
-            sorted_indices = torch.argsort(topk_indices)
+            sorted_indices, sorting_indices = torch.sort(topk_indices)
 
             y = x.clone()
             x = x.gather(
@@ -310,7 +310,7 @@ class MoDBlock(nn.Module):
         out = self.feed_forward(self.ffn_norm(h))
         if self.layer_id % self.block_skip and self.router:
             # multiply router weights with hiddens to put router on gradient path
-            out *= topk_weights.gather(1, sorted_indices).unsqueeze(2)
+            out *= topk_weights.gather(1, sorting_indices).unsqueeze(2)
 
         out = h + out
 
